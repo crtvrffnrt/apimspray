@@ -162,7 +162,29 @@ def discover_sharepoint_host(domain):
     except requests.RequestException:
         pass
 
-    # Method 3: OIDC endpoint to confirm Azure AD + get tenant ID
+    # Method 3: DKIM CNAME records — very reliable when present
+    # selector1._domainkey.domain.com CNAME -> selector1-domain-com._domainkey.{tenant}.onmicrosoft.com
+    log("info", "Checking DKIM CNAME records...")
+    for selector in ("selector1", "selector2"):
+        try:
+            dkim_out = subprocess.run(
+                ["dig", "+short", "CNAME", f"{selector}._domainkey.{domain}"],
+                capture_output=True, text=True, timeout=10
+            )
+            if dkim_out.returncode == 0 and dkim_out.stdout.strip():
+                cname = dkim_out.stdout.strip().rstrip(".")
+                # Pattern: selector1-domain-tld._domainkey.TENANTNAME.onmicrosoft.com
+                m = re.search(r'\._domainkey\.([^.]+)\.onmicrosoft\.com$', cname)
+                if m:
+                    dkim_tenant = m.group(1).lower()
+                    log("info", f"DKIM reveals tenant: {dkim_tenant}")
+                    host = _check_sharepoint_name(dkim_tenant)
+                    if host:
+                        return host, f"DKIM CNAME ({cname})"
+        except Exception:
+            pass
+
+    # Method 4: OIDC endpoint to confirm Azure AD + get tenant ID
     log("info", "Querying OpenID configuration...")
     tenant_id = None
     try:
@@ -183,20 +205,20 @@ def discover_sharepoint_host(domain):
     except requests.RequestException:
         pass
 
-    # Method 4: DNS MX record — look for *.mail.protection.outlook.com
+    # Method 5: DNS MX record — look for *.mail.protection.outlook.com
     log("info", "Checking DNS MX records...")
     try:
-        import subprocess as sp
-        mx_out = sp.run(["dig", "+short", "MX", domain], capture_output=True, text=True, timeout=10)
+        mx_out = subprocess.run(
+            ["dig", "+short", "MX", domain],
+            capture_output=True, text=True, timeout=10
+        )
         if mx_out.returncode == 0 and mx_out.stdout:
             for line in mx_out.stdout.strip().split("\n"):
                 parts = line.strip().split()
                 if len(parts) >= 2:
                     mx_host = parts[-1].rstrip(".")
                     if "mail.protection.outlook.com" in mx_host:
-                        # e.g. nedsfoundation.mail.protection.outlook.com -> nedsfoundation
                         mx_prefix = mx_host.split(".mail.protection.outlook.com")[0]
-                        # Strip trailing hyphens from mx prefix
                         mx_prefix = mx_prefix.rstrip("-")
                         if mx_prefix and mx_prefix != base:
                             log("info", f"MX record suggests tenant: {mx_prefix}")
@@ -206,8 +228,33 @@ def discover_sharepoint_host(domain):
     except Exception:
         pass
 
-    # Method 5: Common variations
-    candidates = []
+    # Method 6: Brand name abbreviations
+    # FederationBrandName like "New England Donor Services, Inc." -> try abbreviations
+    # Orgs often use creative abbreviations: first letters of some words + full remaining words
+    brand_candidates = []
+    if brand:
+        words = re.sub(r'[^a-zA-Z0-9\s]', '', brand).split()
+        words_lower = [w.lower() for w in words if w.lower() not in
+                       ("inc", "llc", "corp", "co", "ltd", "the", "of", "and", "for")]
+        if len(words_lower) >= 2:
+            # Acronym from first letters: "New England Donor Services" -> "neds"
+            acronym = "".join(w[0] for w in words_lower)
+            brand_candidates.append(acronym)
+            # First N words joined: newengland, newenglanddonor
+            for i in range(2, len(words_lower)):
+                brand_candidates.append("".join(words_lower[:i]))
+            # Abbreviate first K words to first N letters + remaining full words
+            # e.g. "New England Donor Services" -> ne+donorservices, n+englanddonorservices
+            for abbrev_count in range(1, min(len(words_lower), 4)):
+                remaining = "".join(words_lower[abbrev_count:])
+                if not remaining:
+                    continue
+                for letter_count in (1, 2, 3):
+                    prefix = "".join(w[:letter_count] for w in words_lower[:abbrev_count])
+                    brand_candidates.append(prefix + remaining)
+
+    # Method 7: Common domain variations + brand abbreviations
+    candidates = list(brand_candidates)
     if tld:
         candidates.append(f"{base}{tld}")           # nedsorg
         candidates.append(f"{base}-{tld}")           # neds-org
@@ -217,11 +264,13 @@ def discover_sharepoint_host(domain):
     else:
         candidates.append(f"the{base}")
     # Try with common suffixes
-    for suffix in ("inc", "corp", "co", "llc", "org", "foundation", "edu"):
+    for suffix in ("inc", "corp", "co", "llc", "org", "foundation", "edu", "online"):
         candidates.append(f"{base}{suffix}")
 
-    # Deduplicate, skip already-tried base
+    # Deduplicate, skip already-tried names
     seen = {base}
+    if brand:
+        seen.add(re.sub(r'[^a-zA-Z0-9]', '', brand).lower())  # full brand already tried in Method 2
     for candidate in candidates:
         candidate = re.sub(r'[^a-zA-Z0-9]', '', candidate).lower()
         if candidate in seen or not candidate:
