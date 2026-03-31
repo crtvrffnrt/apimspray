@@ -936,7 +936,7 @@ def main():
 def _run_enumerate(args):
     """Execute OneDrive-based user enumeration."""
     from onedrive_enum import OneDriveEnumerator
-    from onedrive_proxy import derive_sharepoint_host
+    from onedrive_proxy import derive_sharepoint_host, verify_tenant, discover_sharepoint_host
 
     if not args.users:
         print_error("Enumerate mode requires --users (file of candidate email addresses)")
@@ -964,7 +964,28 @@ def _run_enumerate(args):
             print_error("--tenant is required when not using --aci-urls")
             sys.exit(1)
         try:
-            tenant_name = derive_sharepoint_host(args.tenant, args.domain).split("-my.")[0]
+            sp_host = derive_sharepoint_host(args.tenant, args.domain)
+            # Verify the derived host actually works
+            ok, status = verify_tenant(sp_host)
+            if ok:
+                tenant_name = sp_host.split("-my.")[0]
+            else:
+                # Try auto-discovery
+                discover_domain = args.domain or args.tenant
+                if "." in discover_domain:
+                    print_warn(f"{sp_host} not valid (HTTP {status or 'no response'}). Running auto-discovery...")
+                    discovered_host, method = discover_sharepoint_host(discover_domain)
+                    if discovered_host:
+                        tenant_name = discovered_host.split("-my.")[0]
+                        print_success(f"Discovered SharePoint tenant: {style(tenant_name, TermColors.GREEN, TermColors.BOLD)} (via {method})")
+                    else:
+                        print_error(f"Could not find a valid SharePoint host for {discover_domain}. "
+                                    f"Use --tenant with the correct SharePoint subdomain.")
+                        sys.exit(1)
+                else:
+                    print_error(f"Tenant verification failed for {sp_host} (HTTP {status or 'no response'}). "
+                                f"Check the tenant name or pass a full domain for auto-discovery.")
+                    sys.exit(1)
         except ValueError as e:
             print_error(str(e))
             sys.exit(1)

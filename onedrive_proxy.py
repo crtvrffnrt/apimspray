@@ -8,6 +8,7 @@ import argparse
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import threading
@@ -102,6 +103,138 @@ def verify_tenant(sharepoint_host):
         return False, None
 
 
+def _check_sharepoint_name(name):
+    """Test if a given name resolves as a SharePoint tenant. Returns the host if valid, else None."""
+    host = f"{name}-my.sharepoint.com"
+    ok, status = verify_tenant(host)
+    return host if ok else None
+
+
+def discover_sharepoint_host(domain):
+    """
+    Auto-discover the SharePoint tenant hostname for a given email domain.
+
+    Tries multiple discovery methods:
+      1. Simple domain prefix (contoso.com -> contoso-my.sharepoint.com)
+      2. GetUserRealm API — returns FederationBrandName which is often the tenant name
+      3. OIDC endpoint — confirms the domain is Azure AD and gets the tenant GUID
+      4. DNS MX records — *.mail.protection.outlook.com pattern reveals tenant prefix
+      5. Common variations (domaintld, domain-tld, etc.)
+
+    Returns (sharepoint_host, method_used) or (None, None) if all methods fail.
+    """
+    base = domain.split(".")[0]
+    tld = domain.split(".")[-1] if "." in domain else ""
+
+    # Method 1: Simple prefix (most common case)
+    log("info", f"Trying {base}-my.sharepoint.com ...")
+    host = _check_sharepoint_name(base)
+    if host:
+        return host, "domain prefix"
+
+    # Method 2: GetUserRealm API
+    log("info", "Querying GetUserRealm API for tenant info...")
+    try:
+        realm_resp = requests.get(
+            f"https://login.microsoftonline.com/getuserrealm.srf?login=user@{domain}&xml=0",
+            timeout=10
+        )
+        if realm_resp.status_code == 200:
+            realm = realm_resp.json()
+            ns_type = realm.get("NameSpaceType")
+            brand = realm.get("FederationBrandName", "")
+            cloud_instance = realm.get("CloudInstanceName", "")
+
+            if ns_type == "Unknown":
+                log("warn", f"{domain} is not a valid Microsoft 365 domain (NameSpaceType: Unknown)")
+                return None, None
+
+            log("info", f"NameSpaceType: {ns_type}, FederationBrandName: {brand}")
+
+            # Try the brand name as tenant (clean it for SharePoint subdomain format)
+            if brand:
+                brand_clean = re.sub(r'[^a-zA-Z0-9]', '', brand).lower()
+                if brand_clean and brand_clean != base:
+                    log("info", f"Trying brand name: {brand_clean}-my.sharepoint.com ...")
+                    host = _check_sharepoint_name(brand_clean)
+                    if host:
+                        return host, f"FederationBrandName ({brand})"
+    except requests.RequestException:
+        pass
+
+    # Method 3: OIDC endpoint to confirm Azure AD + get tenant ID
+    log("info", "Querying OpenID configuration...")
+    tenant_id = None
+    try:
+        oidc_resp = requests.get(
+            f"https://login.microsoftonline.com/{domain}/.well-known/openid-configuration",
+            timeout=10
+        )
+        if oidc_resp.status_code == 200:
+            oidc = oidc_resp.json()
+            issuer = oidc.get("issuer", "")
+            # Extract tenant GUID from issuer URL
+            m = re.search(r'/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/', issuer)
+            if m:
+                tenant_id = m.group(1)
+                log("info", f"Tenant ID: {tenant_id}")
+        else:
+            log("warn", f"OIDC lookup failed (HTTP {oidc_resp.status_code}) — domain may not be Azure AD")
+    except requests.RequestException:
+        pass
+
+    # Method 4: DNS MX record — look for *.mail.protection.outlook.com
+    log("info", "Checking DNS MX records...")
+    try:
+        import subprocess as sp
+        mx_out = sp.run(["dig", "+short", "MX", domain], capture_output=True, text=True, timeout=10)
+        if mx_out.returncode == 0 and mx_out.stdout:
+            for line in mx_out.stdout.strip().split("\n"):
+                parts = line.strip().split()
+                if len(parts) >= 2:
+                    mx_host = parts[-1].rstrip(".")
+                    if "mail.protection.outlook.com" in mx_host:
+                        # e.g. nedsfoundation.mail.protection.outlook.com -> nedsfoundation
+                        mx_prefix = mx_host.split(".mail.protection.outlook.com")[0]
+                        # Strip trailing hyphens from mx prefix
+                        mx_prefix = mx_prefix.rstrip("-")
+                        if mx_prefix and mx_prefix != base:
+                            log("info", f"MX record suggests tenant: {mx_prefix}")
+                            host = _check_sharepoint_name(mx_prefix)
+                            if host:
+                                return host, f"DNS MX ({mx_host})"
+    except Exception:
+        pass
+
+    # Method 5: Common variations
+    candidates = []
+    if tld:
+        candidates.append(f"{base}{tld}")           # nedsorg
+        candidates.append(f"{base}-{tld}")           # neds-org
+    # Try with "the" prefix stripped or added
+    if base.startswith("the"):
+        candidates.append(base[3:])
+    else:
+        candidates.append(f"the{base}")
+    # Try with common suffixes
+    for suffix in ("inc", "corp", "co", "llc", "org", "foundation", "edu"):
+        candidates.append(f"{base}{suffix}")
+
+    # Deduplicate, skip already-tried base
+    seen = {base}
+    for candidate in candidates:
+        candidate = re.sub(r'[^a-zA-Z0-9]', '', candidate).lower()
+        if candidate in seen or not candidate:
+            continue
+        seen.add(candidate)
+        log("info", f"Trying variation: {candidate}-my.sharepoint.com ...")
+        host = _check_sharepoint_name(candidate)
+        if host:
+            return host, f"name variation ({candidate})"
+
+    return None, None
+
+
 def deploy(tenant, domain, regions, count, outfile):
     """Deploy ACI containers as OneDrive enum proxies."""
     sharepoint_host = derive_sharepoint_host(tenant, domain)
@@ -110,9 +243,23 @@ def deploy(tenant, domain, regions, count, outfile):
     log("info", f"Verifying tenant: {sharepoint_host}...")
     ok, status = verify_tenant(sharepoint_host)
     if not ok:
-        status_str = str(status) if status else "no response"
-        die(f"Tenant verification failed for {sharepoint_host} (HTTP {status_str}). "
-            f"Check that the tenant exists and has SharePoint/OneDrive enabled.")
+        # Simple derivation failed — try auto-discovery
+        discover_domain = domain or tenant
+        if "." in discover_domain:
+            log("warn", f"{sharepoint_host} returned HTTP {status or 'no response'}. "
+                f"Attempting auto-discovery for {discover_domain}...")
+            discovered_host, method = discover_sharepoint_host(discover_domain)
+            if discovered_host:
+                log("ok", f"Discovered SharePoint host: {discovered_host} (via {method})")
+                sharepoint_host = discovered_host
+            else:
+                die(f"Tenant verification failed for {sharepoint_host} and auto-discovery "
+                    f"could not find a valid SharePoint host for {discover_domain}. "
+                    f"Use --tenant with the correct SharePoint subdomain.")
+        else:
+            status_str = str(status) if status else "no response"
+            die(f"Tenant verification failed for {sharepoint_host} (HTTP {status_str}). "
+                f"Check that the tenant exists and has SharePoint/OneDrive enabled.")
     timestamp = int(time.time())
     rg_name = f"{RG_PREFIX}{timestamp}"
     acr_name = f"{ACR_PREFIX}{timestamp}"
@@ -285,6 +432,8 @@ def main():
     )
     parser.add_argument("--deploy", action="store_true",
                         help="Deploy ACI containers")
+    parser.add_argument("--discover", action="store_true",
+                        help="Auto-discover the SharePoint tenant name for a domain")
     parser.add_argument("--destroy", action="store_true",
                         help="Delete all odproxy resource groups")
     parser.add_argument("--delete-old", action="store_true",
@@ -301,6 +450,28 @@ def main():
                         help="Output file for proxy URLs")
 
     args = parser.parse_args()
+
+    if args.discover:
+        if not args.tenant:
+            die("--tenant is required for discovery (e.g. --discover --tenant neds.org)")
+        domain = args.tenant
+        log("info", f"Auto-discovering SharePoint tenant for: {domain}")
+        # First try simple derivation
+        simple_host = derive_sharepoint_host(domain)
+        ok, status = verify_tenant(simple_host)
+        if ok:
+            log("ok", f"SharePoint host: {simple_host}")
+            return
+        log("warn", f"{simple_host} returned HTTP {status or 'no response'}")
+        host, method = discover_sharepoint_host(domain)
+        if host:
+            log("ok", f"Discovered: {host} (via {method})")
+            tenant_name = host.split("-my.")[0]
+            print(f"\nUse this for enumeration:")
+            print(f"  python3 apimspray.py --mode enumerate --tenant {tenant_name} --users users.txt")
+        else:
+            die(f"Could not discover SharePoint tenant for {domain}")
+        return
 
     if args.destroy:
         destroy()
