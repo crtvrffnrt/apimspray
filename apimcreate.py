@@ -402,8 +402,8 @@ def _extract_urls_fallback(resource_group, timestamp, login_instances, teams_ins
     return login_urls, teams_urls
 
 
-def _poll_deployment(resource_group, deploy_name, total_instances, poll_interval=15):
-    """Poll ARM deployment until terminal state, printing per-resource progress."""
+def _poll_deployment(resource_group, deploy_name, total_instances, poll_interval=15, timeout=600):
+    """Poll ARM deployment until terminal state or timeout, printing per-resource progress."""
     start = time.monotonic()
 
     while True:
@@ -422,28 +422,31 @@ def _poll_deployment(resource_group, deploy_name, total_instances, poll_interval
             log("info", f"Waiting for deployment to register... ({elapsed}s)")
             continue
 
-        # Count APIM instances in the resource group by provisioning state
+        # Query per-instance provisioning state (name + state)
         res_json = run_command(
             f"az resource list "
             f"--resource-group {resource_group} "
             f"--resource-type Microsoft.ApiManagement/service "
-            f"--query \"[].provisioningState\" -o json",
+            f"--query \"[].{{name:name, state:provisioningState}}\" -o json",
             check=False,
         )
 
         succeeded = 0
         running = 0
         failed = 0
+        stuck_names = []
         if res_json:
             try:
-                states = json.loads(res_json)
-                for s in states:
+                resources = json.loads(res_json)
+                for r in resources:
+                    s = r.get("state", "")
                     if s == "Succeeded":
                         succeeded += 1
                     elif s in ("Failed", "Canceled"):
                         failed += 1
                     else:
                         running += 1
+                        stuck_names.append(r.get("name", "?"))
             except (json.JSONDecodeError, TypeError):
                 pass
 
@@ -469,6 +472,12 @@ def _poll_deployment(resource_group, deploy_name, total_instances, poll_interval
                     log("error", f"{failed} instance(s) failed to provision")
             else:
                 log("warn", f"Deployment canceled after {time_str}")
+            return
+
+        # Timeout — proceed with whatever succeeded
+        if elapsed >= timeout and succeeded > 0:
+            log("warn", f"Timeout after {time_str} — {running} instance(s) still provisioning: {', '.join(stuck_names)}")
+            log("warn", f"Proceeding with {succeeded} successfully provisioned instance(s)")
             return
 
 
