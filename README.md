@@ -23,7 +23,7 @@
 
 apimspray is a specialized **Entra ID Passwordspraying Toolkit** designed for authorized security research and Red Teaming. It utilizes Azure API Management (APIM) gateways as a distributed, rotating proxy layer for IP Rotating.
 
-Read ![Blog Post](https://patrickbinder.medium.com/entra-id-password-spraying-using-apim-as-ip-rotating-mechanism-3620861dd66a) for more Details about this project
+Read [Blog Post](https://patrickbinder.medium.com/entra-id-password-spraying-using-apim-as-ip-rotating-mechanism-3620861dd66a) for more Details about this project
 ## Prerequisites
 
 - **Azure CLI (`az`)**: Required for the rotator script to deploy resources. (Execute script from cli session already authenticated to az cli or use Azure Cloud Shell)
