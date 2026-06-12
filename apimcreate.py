@@ -39,6 +39,7 @@ def run_command(command, check=True):
         return None
 
 DEFAULT_RG_LOCATION = "germanywestcentral"
+TTL_SECONDS = 28800  # 8 hours — auto-delete resource groups older than this on deploy
 
 def get_az_regions():
     cmd = (
@@ -89,6 +90,9 @@ def main():
         run_command("az account show")
     except Exception:
         die("Azure CLI not logged in. Run: az login")
+
+    # Auto-cleanup expired resource groups
+    _cleanup_expired_groups()
 
     # Handle deletion
     if args.delete_only or args.delete_old:
@@ -500,6 +504,39 @@ def _delete_old_groups():
         log("ok", f"Queued {deleted} resource group(s) for deletion")
     else:
         log("info", "No old resource groups found")
+
+
+def _cleanup_expired_groups():
+    """Auto-delete resource groups older than TTL_SECONDS."""
+    now = int(time.time())
+    expired = 0
+    for prefix in ("apim-deploy-", "apim-rotator-", "apim-teams-rotator-"):
+        try:
+            output = run_command(
+                f"az group list --query \"[?starts_with(name, '{prefix}')].name\" -o tsv",
+                check=False,
+            )
+            if not output:
+                continue
+            for name in output.strip().split("\n"):
+                name = name.strip()
+                if not name:
+                    continue
+                suffix = name[len(prefix):]
+                try:
+                    ts = int(suffix)
+                except ValueError:
+                    continue
+                age = now - ts
+                if age > TTL_SECONDS:
+                    hours = age / 3600
+                    log("info", f"Auto-deleting expired group {name} ({hours:.1f}h old)")
+                    run_command(f"az group delete --name {name} --yes --no-wait")
+                    expired += 1
+        except Exception:
+            pass
+    if expired:
+        log("ok", f"Cleaned up {expired} expired resource group(s)")
 
 
 if __name__ == "__main__":
