@@ -1,4 +1,30 @@
 *.txt
+*.zip
+*.json.bak
+
+# Assessment output
 results/
+[0-9]*/
+
+# Assessment input files (wordlists, proxy URLs, account lists)
+harborUsernames
+sacaccounts
+aciproxies
+enum_urls.txt
+urls.txt
+spray_urls.txt
+
+# Claude Code local settings (may contain tokens)
+.claude/
+
+# Python
 __pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Misc
 GEMINI.md
+debug_enum.py
+passwords
