@@ -57,6 +57,7 @@ DEFAULT_REGIONS = [
 ]
 RG_PREFIX = "odproxy-"
 ACR_PREFIX = "odproxyreg"
+TTL_SECONDS = 28800  # 8 hours — auto-delete resource groups older than this on deploy
 
 UUID_RE = re.compile(
     r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
@@ -282,6 +283,36 @@ def discover_sharepoint_host(domain):
             return host, f"name variation ({candidate})"
 
     return None, None
+
+
+def _cleanup_expired_groups():
+    """Auto-delete odproxy resource groups older than TTL_SECONDS."""
+    now = int(time.time())
+    try:
+        groups_json = run_command(
+            f"az group list --query \"[?starts_with(name, '{RG_PREFIX}')].name\" -o json",
+            check=False,
+        )
+        groups = json.loads(groups_json) if groups_json else []
+    except Exception:
+        return
+
+    expired = 0
+    for name in groups:
+        suffix = name[len(RG_PREFIX):]
+        try:
+            ts = int(suffix)
+        except ValueError:
+            continue
+        age = now - ts
+        if age > TTL_SECONDS:
+            hours = age / 3600
+            log("info", f"Auto-deleting expired group {name} ({hours:.1f}h old)")
+            run_command(f"az group delete --name {name} --yes --no-wait", check=False)
+            expired += 1
+
+    if expired:
+        log("ok", f"Cleaned up {expired} expired resource group(s)")
 
 
 def deploy(tenant, domain, regions, count, outfile):
@@ -528,6 +559,9 @@ def main():
 
     if args.delete_old:
         destroy()
+
+    # Auto-cleanup expired resource groups
+    _cleanup_expired_groups()
 
     if not args.deploy:
         parser.print_help()

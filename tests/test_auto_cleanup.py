@@ -106,3 +106,56 @@ def test_cleanup_ignores_unparseable_names():
         apimcreate._cleanup_expired_groups()
 
     assert len(delete_calls) == 0
+
+
+# --- OneDrive proxy cleanup ---
+
+import onedrive_proxy
+
+
+def test_od_cleanup_deletes_expired_groups():
+    """OD proxy groups older than TTL are deleted."""
+    now = int(time.time())
+    old_ts = now - 30000
+    fresh_ts = now - 100
+
+    groups = [f"odproxy-{old_ts}", f"odproxy-{fresh_ts}"]
+
+    delete_calls = []
+    def fake_run(cmd, check=True):
+        if "group list" in cmd:
+            return json.dumps(groups)
+        if "group delete" in cmd:
+            delete_calls.append(cmd)
+        return ""
+
+    with patch("onedrive_proxy.run_command", side_effect=fake_run), \
+         patch("onedrive_proxy.time") as mock_time:
+        mock_time.time.return_value = now
+        mock_time.monotonic = time.monotonic
+        onedrive_proxy._cleanup_expired_groups()
+
+    assert len(delete_calls) == 1
+    assert str(old_ts) in delete_calls[0]
+
+
+def test_od_cleanup_skips_fresh_groups():
+    """No deletions when all OD groups are fresh."""
+    now = int(time.time())
+    fresh_ts = now - 100
+
+    delete_calls = []
+    def fake_run(cmd, check=True):
+        if "group list" in cmd:
+            return json.dumps([f"odproxy-{fresh_ts}"])
+        if "group delete" in cmd:
+            delete_calls.append(cmd)
+        return ""
+
+    with patch("onedrive_proxy.run_command", side_effect=fake_run), \
+         patch("onedrive_proxy.time") as mock_time:
+        mock_time.time.return_value = now
+        mock_time.monotonic = time.monotonic
+        onedrive_proxy._cleanup_expired_groups()
+
+    assert len(delete_calls) == 0
